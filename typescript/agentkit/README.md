@@ -791,6 +791,19 @@ it will return payment details that can be used on retry.</td>
 </table>
 </details>
 <details>
+<summary><strong>SingIt</strong></summary>
+<table width="100%">
+<tr>
+    <td width="200"><code>list_models</code></td>
+    <td width="768">Lists the language models available through SingIt Ask, with their ids and prices. Free, no payment.</td>
+</tr>
+<tr>
+    <td width="200"><code>ask</code></td>
+    <td width="768">Asks a model a question and pays for the answer in USDC on Base or Solana over x402, within a configurable per-call limit.</td>
+</tr>
+</table>
+</details>
+<details>
 <summary><strong>Yelay</strong></summary>
 <table width="100%">
 <tr>
