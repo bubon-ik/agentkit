@@ -794,12 +794,16 @@ it will return payment details that can be used on retry.</td>
 <summary><strong>SingIt</strong></summary>
 <table width="100%">
 <tr>
-    <td width="200"><code>list_models</code></td>
-    <td width="768">Lists the language models available through SingIt Ask, with their ids and prices. Free, no payment.</td>
+    <td width="200"><code>singit_ask</code></td>
+    <td width="768">Buy LLM answers over x402 on Base with required per-call and per-day client-side spending ceilings.</td>
 </tr>
 <tr>
-    <td width="200"><code>ask</code></td>
-    <td width="768">Asks a model a question and pays for the answer in USDC on Base or Solana over x402, within a configurable per-call limit.</td>
+    <td width="200"><code>singit_search</code></td>
+    <td width="768">Buy web search results over x402 on Base within the same spending ceilings.</td>
+</tr>
+<tr>
+    <td width="200"><code>singit_spend_status</code></td>
+    <td width="768">Read local spending and the next 00:00 UTC reset. Free, no network request.</td>
 </tr>
 </table>
 </details>

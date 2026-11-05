@@ -1,228 +1,375 @@
 import { z } from "zod";
 import { x402Client, wrapFetchWithPayment } from "@x402/fetch";
 import { registerExactEvmScheme } from "@x402/evm/exact/client";
-import { registerExactSvmScheme } from "@x402/svm/exact/client";
 import { ActionProvider } from "../actionProvider";
 import { CreateAction } from "../actionDecorator";
-import { EvmWalletProvider, SvmWalletProvider, WalletProvider } from "../../wallet-providers";
+import { EvmWalletProvider } from "../../wallet-providers";
 import { Network } from "../../network";
 import { getX402Networks, isUsdcAsset } from "../x402/utils";
-import { AskSchema, ListModelsSchema, SingitConfig } from "./schemas";
+import { AskSchema, SearchSchema, SpendStatusSchema, SingItConfig } from "./schemas";
+import {
+  DEFAULT_BASE_URL,
+  DEFAULT_MODEL,
+  DEFAULT_MAX_TOKENS,
+  REQUEST_TIMEOUT_MS,
+  USDC_DECIMALS,
+} from "./constants";
 
-const SINGIT_ASK_URL = "https://ask.singitai.app";
-const SUPPORTED_NETWORKS = ["base-mainnet", "solana-mainnet"];
-const DEFAULT_MODEL = "deepseek-v4.1-flash";
-const DEFAULT_MAX_TOKENS = 800;
-const DEFAULT_MAX_PAYMENT_USDC = 0.05;
-const USDC_DECIMALS = 6;
-const REQUEST_TIMEOUT_MS = 60_000;
-
-/**
- * SingitActionProvider lets an agent buy language-model answers from SingIt Ask,
- * an x402 gateway that is paid per call in USDC on Base or Solana, with no account or API key.
- */
-export class SingitActionProvider extends ActionProvider<WalletProvider> {
-  private readonly maxPaymentAtomic: bigint;
+/** Buys SingIt answers and searches with client-side spending ceilings. */
+export class SingItActionProvider extends ActionProvider<EvmWalletProvider> {
+  private readonly perCallAtomic: bigint;
+  private readonly perDayAtomic: bigint;
+  private readonly baseUrl: string;
+  private spentAtomic = 0n;
+  private day = "";
+  private queue: Promise<void> = Promise.resolve();
 
   /**
-   * Creates a new SingitActionProvider.
+   * Creates a provider with mandatory spending ceilings.
    *
-   * @param config - Optional configuration, mainly the per-call payment limit
+   * @param config - Required ceilings and optional gateway
    */
-  constructor(config: SingitConfig = {}) {
+  constructor(config: SingItConfig) {
     super("singit", []);
-    const envLimit = process.env.SINGIT_MAX_PAYMENT_USDC?.trim();
-    if (config.maxPaymentUsdc !== undefined) {
-      const limit = config.maxPaymentUsdc;
-      if (!Number.isFinite(limit) || limit < 0) {
-        throw new Error("SingIt maxPaymentUsdc must be a non-negative number");
-      }
-      const decimal = String(limit);
-      if (decimal.includes("e")) {
-        if (limit < 1e-6) {
-          this.maxPaymentAtomic = 0n;
-          return;
-        }
-        throw new Error("SingIt maxPaymentUsdc must be less than 1e21");
-      }
-      this.maxPaymentAtomic = this.floorPaymentAtomic(decimal);
-    } else {
-      if (envLimit && !/^\d+(\.\d+)?$/.test(envLimit)) {
-        throw new Error("SingIt SINGIT_MAX_PAYMENT_USDC must be a non-negative number");
-      }
-      this.maxPaymentAtomic = this.floorPaymentAtomic(envLimit || String(DEFAULT_MAX_PAYMENT_USDC));
+    this.perCallAtomic = this.validateCeiling(config?.maxPerCallUsd, "maxPerCallUsd");
+    this.perDayAtomic = this.validateCeiling(config?.maxPerDayUsd, "maxPerDayUsd");
+    if (config.maxPerCallUsd > config.maxPerDayUsd) {
+      throw new Error("SingIt maxPerCallUsd must not exceed maxPerDayUsd");
     }
-  }
-
-  /**
-   * Lists the models SingIt Ask serves. Free, no payment.
-   *
-   * @param _walletProvider - The wallet provider (unused, listing models is free)
-   * @param _args - No parameters
-   * @returns A JSON string with the models and their prices
-   */
-  @CreateAction({
-    name: "list_models",
-    description: `
-Lists the language models available through SingIt Ask (https://ask.singitai.app), a pay-per-call gateway.
-Listing is free. Returns each model id, name, tags and, where known, its price per million tokens in USD.
-Use an id from this list as the model for the ask action.
-Includes the free model 'free/deepseek-v4.1-flash', which answers without any payment within a small daily limit.`,
-    schema: ListModelsSchema,
-  })
-  async listModels(
-    _walletProvider: WalletProvider,
-    _args: z.infer<typeof ListModelsSchema>,
-  ): Promise<string> {
+    const baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
+    let url: URL;
     try {
-      const response = await fetch(`${SINGIT_ASK_URL}/v1/models`, {
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (!response.ok) {
-        return JSON.stringify({
-          error: true,
-          message: `SingIt returned status ${response.status} for the model list`,
-        });
-      }
-      const body = (await response.json()) as { data?: Array<Record<string, unknown>> };
-      const models = (body.data ?? []).map(model => ({
-        id: model.id,
-        name: model.name,
-        tags: model.tags,
-        free: model.free,
-        usdPerMillionTokens: model.singitUsdPerMillionTokens,
-        recommendedScheme: model.recommendedScheme,
-      }));
-      return JSON.stringify({ success: true, models }, null, 2);
-    } catch (error) {
-      return JSON.stringify({
-        error: true,
-        message: `Failed to list SingIt models: ${error instanceof Error ? error.message : String(error)}`,
-      });
+      url = new URL(baseUrl);
+    } catch {
+      throw new Error("SingIt baseUrl must be a valid HTTPS URL");
     }
+    if (
+      url.protocol !== "https:" &&
+      !(url.protocol === "http:" && ["localhost", "127.0.0.1"].includes(url.hostname))
+    ) {
+      throw new Error(
+        "SingIt baseUrl must use https:// (http:// is allowed only for localhost or 127.0.0.1)",
+      );
+    }
+    this.baseUrl = baseUrl.replace(/\/+$/, "");
   }
 
   /**
-   * Asks a model a question and pays for the answer over x402.
+   * Requests a model answer.
    *
-   * @param walletProvider - The wallet provider that signs the USDC payment
-   * @param args - The prompt, optional model, system message and token limit
-   * @returns A JSON string with the answer and what was charged
+   * @param walletProvider - Payment provider
+   * @param args - Prompt and model
+   * @returns JSON result with billing and charged amount
    */
   @CreateAction({
-    name: "ask",
-    description: `
-Asks a language model a question through SingIt Ask (https://ask.singitai.app) and pays for the answer
-in USDC from the agent's wallet, on Base or Solana, using the x402 protocol. No account or API key is needed.
-The price depends on the model and on maxTokens (a short answer from a small model costs a fraction of a cent).
-A payment above the configured per-call limit is never signed.
-Call list_models first if you are unsure which model to use.
-Use model 'free/deepseek-v4.1-flash' for a short answer (up to 400 tokens) with no payment.
-For Claude Opus models the flat price used here includes room for thinking tokens and is usually dearer than for other models.
-A failed call may still have been charged; check settlement/billing and do not blindly retry.
-Returns the model's answer and the amount charged in USDC micro-units (billing.totalAtomic).`,
+    name: "singit_ask",
     schema: AskSchema,
+    description: `Buys a language-model answer from SingIt (https://ask.singitai.app) and pays for it in USDC on Base over x402, from the agent's wallet.
+Takes a prompt and optionally a model id (see https://ask.singitai.app/v1/models; leave it empty for the default model). The model 'free/deepseek-v4.1-flash' answers a short prompt with no payment, within a small daily limit.
+The provider never signs a price above its per-call ceiling or above what is left of today's ceiling, and the model cannot change the ceilings. If a price is refused, tell the user instead of retrying.
+Returns the answer, the server's billing details and the amount charged for this call. A failed call may still have been charged: check the returned settlement details and do not blindly retry.`,
   })
-  async ask(walletProvider: WalletProvider, args: z.infer<typeof AskSchema>): Promise<string> {
+  async ask(walletProvider: EvmWalletProvider, args: z.infer<typeof AskSchema>): Promise<string> {
+    const model = args.model ?? DEFAULT_MODEL;
+    return this.request(
+      walletProvider,
+      "/v1/chat/completions",
+      { model, max_tokens: DEFAULT_MAX_TOKENS, messages: [{ role: "user", content: args.prompt }] },
+      model.startsWith("free/"),
+      false,
+    );
+  }
+
+  /**
+   * Requests web search results.
+   *
+   * @param walletProvider - Payment provider
+   * @param args - Query and result count
+   * @returns JSON search results and charges
+   */
+  @CreateAction({
+    name: "singit_search",
+    schema: SearchSchema,
+    description: `Buys web search results from SingIt (https://ask.singitai.app) and pays for them in USDC on Base over x402, from the agent's wallet.
+Takes a search query and optionally a number of results (1 to 25, default 5; results beyond 10 cost extra).
+The provider never signs a price above its per-call ceiling or above what is left of today's ceiling. If a price is refused, tell the user instead of retrying.
+Returns the ranked results, the server's billing details and the amount charged for this call. A failed call may still have been charged: check the returned settlement details and do not blindly retry.`,
+  })
+  async search(
+    walletProvider: EvmWalletProvider,
+    args: z.infer<typeof SearchSchema>,
+  ): Promise<string> {
+    return this.request(
+      walletProvider,
+      "/v1/exa/search",
+      { query: args.query, numResults: args.numResults ?? 5 },
+      false,
+      true,
+    );
+  }
+
+  /**
+   * Reports local spending without a network request.
+   *
+   * @param _walletProvider - Unused payment provider
+   * @param _args - Empty parameters
+   * @returns JSON spending status
+   */
+  @CreateAction({
+    name: "singit_spend_status",
+    schema: SpendStatusSchema,
+    description: `Shows how much this agent has spent through the SingIt provider today and how much of its per-call and per-day ceilings is left.
+Free, makes no request. The counter lives in the agent process and resets at 00:00 UTC. Use it before a paid call if you are unsure whether the ceiling leaves room.`,
+  })
+  async spendStatus(
+    _walletProvider: EvmWalletProvider,
+    _args: z.infer<typeof SpendStatusSchema>,
+  ): Promise<string> {
+    this.resetDay();
+    return JSON.stringify({ success: true, ...this.ceilings() });
+  }
+
+  /**
+   * Checks Base mainnet support.
+   *
+   * @param network - Candidate network
+   * @returns Whether the network is supported
+   */
+  supportsNetwork = (network: Network) =>
+    network.protocolFamily === "evm" && network.networkId === "base-mainnet";
+
+  /**
+   * Validates and floors a ceiling to atomic USDC.
+   *
+   * @param value - USD ceiling
+   * @param name - Configuration field
+   * @returns Floored atomic ceiling
+   */
+  private validateCeiling(value: number, name: string): bigint {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0)
+      throw new Error(`SingIt ${name} must be a finite number greater than 0`);
+    if (value >= 1e21) throw new Error(`SingIt ${name} must be less than 1e21`);
+    const decimal = String(value);
+    const atomic = decimal.includes("e") ? 0n : this.floorPaymentAtomic(decimal);
+    if (atomic === 0n) throw new Error(`SingIt ${name} must be at least 0.000001`);
+    return atomic;
+  }
+
+  /** Resets the counter when the UTC day changes. */
+  private resetDay(): void {
+    const day = new Date(Date.now()).toISOString().slice(0, 10);
+    if (day !== this.day) {
+      this.day = day;
+      this.spentAtomic = 0n;
+    }
+  }
+
+  /**
+   * Builds the current ceiling report.
+   *
+   * @returns Local spending status
+   */
+  private ceilings() {
+    return {
+      spentTodayUsd: Number(this.spentAtomic) / 1e6,
+      remainingTodayUsd: Number(this.perDayAtomic - this.spentAtomic) / 1e6,
+      maxPerCallUsd: Number(this.perCallAtomic) / 1e6,
+      maxPerDayUsd: Number(this.perDayAtomic) / 1e6,
+      day: this.day,
+      resetsAt: new Date(Date.parse(`${this.day}T00:00:00.000Z`) + 86400000).toISOString(),
+    };
+  }
+
+  /**
+   * Serializes paid requests through one promise chain.
+   *
+   * @param walletProvider - Payment provider
+   * @param path - API path
+   * @param body - JSON request body
+   * @param free - Whether signing and accounting are bypassed
+   * @param search - Whether to extract search results
+   * @returns JSON response
+   */
+  private async request(
+    walletProvider: EvmWalletProvider,
+    path: string,
+    body: Record<string, unknown>,
+    free: boolean,
+    search: boolean,
+  ): Promise<string> {
+    if (!(walletProvider instanceof EvmWalletProvider))
+      return JSON.stringify({ error: true, message: "Unsupported wallet provider" });
+    if (free) return this.performRequest(walletProvider, path, body, true, search);
+    const previous = this.queue;
+    let release!: () => void;
+    this.queue = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    await previous;
     try {
-      if (
-        !(
-          walletProvider instanceof EvmWalletProvider || walletProvider instanceof SvmWalletProvider
-        )
-      ) {
-        return JSON.stringify({
-          error: true,
-          message: "Unsupported wallet provider",
-          details: "Only EvmWalletProvider and SvmWalletProvider are supported",
+      return await this.performRequest(walletProvider, path, body, false, search);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Performs a single request and accounts for its signed flat price.
+   *
+   * @param walletProvider - Payment provider
+   * @param path - API path
+   * @param body - Request body
+   * @param free - Whether to bypass payments
+   * @param search - Whether to return search results
+   * @returns JSON response
+   */
+  private async performRequest(
+    walletProvider: EvmWalletProvider,
+    path: string,
+    body: Record<string, unknown>,
+    free: boolean,
+    search: boolean,
+  ): Promise<string> {
+    if (!free) this.resetDay();
+    const remaining = this.perDayAtomic - this.spentAtomic;
+    const allowedAtomic = remaining < this.perCallAtomic ? remaining : this.perCallAtomic;
+    let signedAtomic = 0n;
+    let chargedAtomic = 0n;
+    let settlement: Record<string, string | boolean> | undefined;
+    let counted = false;
+    let paymentCreated = false;
+    let knownUncharged = false;
+    try {
+      let requestFetch = fetch;
+      if (!free) {
+        const client = new x402Client();
+        const account = walletProvider.toSigner();
+        registerExactEvmScheme(client, {
+          signer: {
+            ...account,
+            readContract: args =>
+              walletProvider.readContract({
+                ...args,
+                abi: args.abi as never,
+                functionName: args.functionName as never,
+                args: args.args as never,
+              }),
+          },
         });
+        const networks = getX402Networks(walletProvider.getNetwork());
+        client.registerPolicy((_version, requirements) =>
+          requirements.filter(
+            requirement =>
+              requirement.scheme === "exact" &&
+              networks.includes(requirement.network) &&
+              isUsdcAsset(requirement.asset, walletProvider) &&
+              /^\d+$/.test(requirement.amount) &&
+              BigInt(requirement.amount) <= allowedAtomic,
+          ),
+        );
+        client.onBeforePaymentCreation(async ({ selectedRequirements }) => {
+          if (
+            !/^\d+$/.test(selectedRequirements.amount) ||
+            BigInt(selectedRequirements.amount) > allowedAtomic
+          )
+            return { abort: true, reason: "SingIt price exceeds the configured ceiling" };
+        });
+        client.onAfterPaymentCreation(async ({ selectedRequirements }) => {
+          signedAtomic = BigInt(selectedRequirements.amount);
+          paymentCreated = true;
+        });
+        requestFetch = wrapFetchWithPayment(fetch, client);
       }
-
-      const messages: Array<{ role: string; content: string }> = [];
-      if (args.system) {
-        messages.push({ role: "system", content: args.system });
-      }
-      messages.push({ role: "user", content: args.prompt });
-
-      const client = await this.createX402Client(walletProvider);
-      const fetchWithPayment = wrapFetchWithPayment(fetch, client);
-
-      const response = await fetchWithPayment(`${SINGIT_ASK_URL}/v1/chat/completions`, {
+      const response = await requestFetch(`${this.baseUrl}${path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: args.model ?? DEFAULT_MODEL,
-          max_tokens: args.maxTokens ?? DEFAULT_MAX_TOKENS,
-          messages,
-        }),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-
-      const settlement = this.readSettlement(response);
-      let text: string;
-      try {
-        text = await response.text();
-      } catch (error) {
-        return JSON.stringify({
-          error: true,
-          message: `The answer from SingIt Ask could not be read and the payment may have been charged: ${error instanceof Error ? error.message : String(error)}`,
-          settlement,
-        });
+      settlement = this.readSettlement(response);
+      const outcomeUnknown =
+        !response.ok &&
+        settlement?.success !== true &&
+        (response.status === 502 ||
+          response.status === 504 ||
+          (response.status >= 520 && response.status <= 530));
+      if (response.ok || settlement?.success === true || outcomeUnknown)
+        chargedAtomic = signedAtomic;
+      // Gateway failures are uncharged unless a proxy/edge failure leaves settlement uncertain.
+      knownUncharged = !response.ok && settlement?.success !== true && !outcomeUnknown;
+      const text = await response.text();
+      // Commit once the body is readable; failures count the signed price in the catch path.
+      if (!free) {
+        this.resetDay();
+        this.spentAtomic += chargedAtomic;
       }
+      counted = true;
       let data: Record<string, unknown> | undefined;
       try {
-        data = JSON.parse(text) as Record<string, unknown>;
+        data = JSON.parse(text);
       } catch {
         data = undefined;
       }
-
-      if (!response.ok) {
+      const charges = {
+        chargedAtomic: chargedAtomic.toString(),
+        chargedUsd: Number(chargedAtomic) / 1e6,
+      };
+      if (!response.ok)
         return JSON.stringify({
           error: true,
-          message: `SingIt Ask returned status ${response.status}.`,
-          settlement,
-          details: data && Object.keys(data).length > 0 ? data : text.slice(0, 500),
+          message: `SingIt returned status ${response.status}${outcomeUnknown ? "; outcome unknown, counted against today's ceiling" : ""}. A failed call may still have been charged; check settlement and do not blindly retry.`,
+          details: data ?? text.slice(0, 500),
           paymentError: this.readPaymentError(response),
+          settlement,
+          ...charges,
         });
-      }
-
       const choices = data?.choices as Array<{ message?: { content?: unknown } }> | undefined;
-      const answer = choices?.[0]?.message?.content;
-      if (typeof answer !== "string") {
+      if (!search && typeof choices?.[0]?.message?.content !== "string")
         return JSON.stringify({
           error: true,
-          message: "SingIt Ask returned a response without an answer",
+          message: "SingIt returned a response without an answer",
           billing: data?.billing,
           settlement,
+          ...charges,
         });
-      }
-
-      return JSON.stringify(
-        {
-          success: true,
-          model: data?.model,
-          answer,
-          billing: data?.billing,
-          settlement,
-        },
-        null,
-        2,
-      );
+      return JSON.stringify({
+        success: true,
+        ...(search
+          ? { results: data?.results ?? data }
+          : { answer: choices?.[0]?.message?.content, model: data?.model ?? body.model }),
+        billing: data?.billing,
+        settlement,
+        ...charges,
+      });
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (paymentCreated && !knownUncharged) {
+        this.resetDay();
+        this.spentAtomic += signedAtomic - (counted ? chargedAtomic : 0n);
+        chargedAtomic = signedAtomic;
+      }
+      if (
+        !paymentCreated &&
+        message.includes("All payment requirements were filtered out by policies")
+      )
+        return JSON.stringify({
+          error: true,
+          refused: true,
+          message:
+            "SingIt quoted a price above your per-call or remaining daily ceiling, so nothing was signed",
+          ...this.ceilings(),
+          chargedAtomic: "0",
+          chargedUsd: 0,
+        });
       return JSON.stringify({
         error: true,
-        message: `Failed to get an answer from SingIt Ask: ${error instanceof Error ? error.message : String(error)}`,
+        message: `SingIt request failed: ${message}${paymentCreated && !knownUncharged ? "; outcome unknown, counted against today's ceiling" : ""}. A failed call may still have been charged; check settlement and do not blindly retry.`,
+        settlement,
+        chargedAtomic: chargedAtomic.toString(),
+        chargedUsd: Number(chargedAtomic) / 1e6,
       });
     }
   }
-
-  /**
-   * Checks if the action provider supports the given network.
-   *
-   * @param network - The network to check support for
-   * @returns True if the network is supported, false otherwise
-   */
-  supportsNetwork = (network: Network) =>
-    network.networkId !== undefined && SUPPORTED_NETWORKS.includes(network.networkId);
 
   /**
    * Floors a plain decimal payment limit to whole micro-USDC without rounding.
@@ -297,60 +444,12 @@ Returns the model's answer and the amount charged in USDC micro-units (billing.t
       return undefined;
     }
   }
-
-  /**
-   * Creates an x402 client for the wallet that only signs `exact` USDC offers on the wallet's own
-   * network that are within the payment limit.
-   *
-   * @param walletProvider - The wallet provider to sign with
-   * @returns The configured x402 client
-   */
-  private async createX402Client(walletProvider: WalletProvider): Promise<x402Client> {
-    const client = new x402Client();
-
-    if (walletProvider instanceof EvmWalletProvider) {
-      const account = walletProvider.toSigner();
-      const signer = {
-        ...account,
-        readContract: (args: {
-          address: `0x${string}`;
-          abi: readonly unknown[];
-          functionName: string;
-          args?: readonly unknown[];
-        }) =>
-          walletProvider.readContract({
-            address: args.address,
-            abi: args.abi as never,
-            functionName: args.functionName as never,
-            args: args.args as never,
-          }),
-      };
-      registerExactEvmScheme(client, { signer });
-    } else if (walletProvider instanceof SvmWalletProvider) {
-      const signer = await walletProvider.toSigner();
-      registerExactSvmScheme(client, { signer });
-    }
-
-    const networks = getX402Networks(walletProvider.getNetwork());
-    client.registerPolicy((_version, requirements) =>
-      requirements.filter(
-        requirement =>
-          requirement.scheme === "exact" &&
-          networks.includes(requirement.network) &&
-          isUsdcAsset(requirement.asset, walletProvider) &&
-          /^\d+$/.test(requirement.amount) &&
-          BigInt(requirement.amount) <= this.maxPaymentAtomic,
-      ),
-    );
-
-    return client;
-  }
 }
 
 /**
- * Creates a SingIt action provider.
+ * Creates a provider with required client-side ceilings.
  *
- * @param config - Optional per-call payment configuration
- * @returns The configured provider
+ * @param config - Required spending configuration
+ * @returns Configured SingIt provider
  */
-export const singitActionProvider = (config?: SingitConfig) => new SingitActionProvider(config);
+export const singitActionProvider = (config: SingItConfig) => new SingItActionProvider(config);

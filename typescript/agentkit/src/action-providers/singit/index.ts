@@ -1,2 +1,4 @@
+/** SingIt provider and factory. */
 export * from "./singitActionProvider";
-export type { SingitConfig } from "./schemas";
+/** Required SingIt configuration. */
+export type { SingItConfig } from "./schemas";

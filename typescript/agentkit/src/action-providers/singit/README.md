@@ -1,67 +1,49 @@
-# SingIt Action Provider
+# SingIt action provider
 
-This directory contains the **SingitActionProvider**, which lets an agent buy language-model answers from [SingIt Ask](https://ask.singitai.app), an x402 gateway. Each call is paid in USDC on Base or Solana with the agent's own wallet. There is no account and no API key.
+Buy LLM answers and web search results over x402 using USDC on Base mainnet.
 
-## Directory Structure
+## Structure
 
-```
-singit/
-├── singitActionProvider.ts       # Provider with the list_models and ask actions
-├── singitActionProvider.test.ts  # Unit tests
-├── schemas.ts                    # Action schemas and configuration type
-├── index.ts                      # Main exports
-└── README.md                     # This file
-```
+- `singitActionProvider.ts`: actions, payment policy, and spending accounting.
+- `schemas.ts`: action schemas and required `SingItConfig`.
+- `constants.ts`: gateway, model, token budget, and request constants.
+- `index.ts`: public exports.
+- `singitActionProvider.test.ts`: mocked payment and accounting tests.
 
 ## Actions
 
-| Action        | Description                                                                                          |
-| ------------- | ---------------------------------------------------------------------------------------------------- |
-| `list_models` | Lists the models SingIt Ask serves with their ids and prices. Free.                                  |
-| `ask`         | Sends a prompt to a model and pays for the answer over x402. Returns the answer and what was charged. |
+| Action | Description |
+| --- | --- |
+| `singit_ask` | Ask a model a question (1–20000 characters), with an 800-token budget. Null model selects `deepseek-v4.1-flash`. `free/deepseek-v4.1-flash` needs no payment. |
+| `singit_search` | Search the web (1–2000 characters), requesting 1–25 results; null defaults to 5. Results beyond 10 cost extra. |
+| `singit_spend_status` | Read local spending, remaining budget, ceilings, UTC day, and next reset without a network request. |
 
-`ask` accepts a `prompt`, and optionally a `model`, a `system` message and `maxTokens` (1 to 1200, default 800). The price grows with the model and with `maxTokens`. The model id `free/deepseek-v4.1-flash` answers without any payment, up to 400 tokens, within a small daily limit per visitor.
-
-A failed `ask` call may still have been charged. Check the returned `settlement` details and billing before retrying; do not blindly retry. When available, `settlement` includes the payment response header's `success`, `transaction`, `network`, and `errorReason` fields.
+Answers and searches report server billing separately from `chargedAtomic` (USDC micro-units as a string) and `chargedUsd` for the call.
 
 ## Setup
 
 ```typescript
-import { AgentKit, singitActionProvider } from "@coinbase/agentkit";
+import { singitActionProvider } from "@coinbase/agentkit";
 
-const agentkit = await AgentKit.from({
-  walletProvider,
-  actionProviders: [singitActionProvider()],
-});
+const provider = singitActionProvider({ maxPerCallUsd: 0.05, maxPerDayUsd: 1 });
 ```
 
-The wallet provider must be an `EvmWalletProvider` on `base-mainnet` or an `SvmWalletProvider` on `solana-mainnet`, funded with USDC. The wallet pays the USDC amount of the answer, plus a small settlement fee, as shown in the offer.
+Both ceilings are required finite positive numbers, with the per-call ceiling no greater than the daily ceiling. Values are floored to six decimal places and must represent at least 0.000001 USD. Optional `baseUrl` defaults to `https://ask.singitai.app`; HTTPS is required except for HTTP localhost or 127.0.0.1 development servers.
 
-## Configuration
+## Spending ceilings
 
-```typescript
-import { singitActionProvider, SingitConfig } from "@coinbase/agentkit";
+Ceilings are enforced in the agent process (client-side) and cover only calls made through this provider. The counter is in memory: a restart resets it. The daily window resets at 00:00 UTC. All paid calls share a queue to prevent concurrent calls from exceeding the daily ceiling.
 
-const config: SingitConfig = {
-  // Maximum payment per call in USDC whole units.
-  // Default: 0.05 (or the SINGIT_MAX_PAYMENT_USDC env var)
-  maxPaymentUsdc: 0.05,
-};
+Only exact USDC offers on the supported network within the per-call and remaining daily ceilings are eligible for signing. A second check runs before payment creation. Free-model calls cost zero and never change the counter.
 
-const provider = singitActionProvider(config);
-```
+Successful HTTP responses count the signed flat price, independently of server billing. Failed HTTP responses without a successful PAYMENT-RESPONSE settlement count zero, except for proxy/edge statuses 502, 504, and 520–530. Those statuses conservatively count the signed amount against the daily ceiling and report "outcome unknown, counted against today's ceiling". Other failures, including 400 and 503, count zero because the gateway never settles an answer of 400 or above. A thrown error after payment creation, including a timeout or unreadable body, counts the signed amount conservatively because the outcome is unknown. Errors before signing count zero. A failed call may still have been charged; check settlement and do not blindly retry. The provider never retries automatically.
 
-An offer above `maxPaymentUsdc` is never signed. The provider signs only USDC offers on the wallet's own network, and only `exact` ones, a flat price for the call; SingIt also lists a metered `upto` offer, which this provider does not use. For Claude Opus models the flat price includes room for thinking tokens and is usually dearer than the answer used, so prefer other models here.
+## Network support
 
-## Network Support
-
-- `base-mainnet`
-- `solana-mainnet`
-
-Testnets are not supported.
+Base mainnet only (`evm`, `base-mainnet`).
 
 ## Links
 
-- Models and prices: https://ask.singitai.app/v1/models
-- Service description for agents: https://ask.singitai.app/llms.txt
-- First paid call walkthrough: https://github.com/SingItAi/SingItAI/blob/main/docs/first-paid-call.md
+- [SingIt documentation](https://ask.singitai.app/llms.txt)
+- [Model catalog](https://ask.singitai.app/v1/models)
+- [First paid call guide](https://github.com/SingItAi/SingItAI/blob/main/docs/first-paid-call.md)

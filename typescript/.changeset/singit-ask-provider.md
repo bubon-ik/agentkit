@@ -2,4 +2,4 @@
 "@coinbase/agentkit": patch
 ---
 
-Added a SingIt action provider to list models and pay for language-model answers from SingIt Ask with USDC over x402 on Base and Solana
+Added a SingIt action provider to buy LLM answers and web search results over x402 on Base, with required per-call and per-day spending ceilings

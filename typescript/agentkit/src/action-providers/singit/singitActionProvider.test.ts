@@ -1,556 +1,358 @@
-import { SingitActionProvider, singitActionProvider } from "./singitActionProvider";
-import { EvmWalletProvider, SvmWalletProvider } from "../../wallet-providers";
+import { SingItActionProvider, singitActionProvider } from "./singitActionProvider";
+import { AskSchema, SearchSchema, SingItConfig } from "./schemas";
+import { EvmWalletProvider } from "../../wallet-providers";
 import { x402Client, wrapFetchWithPayment } from "@x402/fetch";
-import { registerExactEvmScheme } from "@x402/evm/exact/client";
-import { registerExactSvmScheme } from "@x402/svm/exact/client";
 
 jest.mock("@x402/fetch");
 jest.mock("@x402/evm/exact/client");
-jest.mock("@x402/svm/exact/client");
-
+const mockPolicy = jest.fn();
+const mockBefore = jest.fn();
+const mockAfter = jest.fn();
+const mockSign = jest.fn();
 const mockFetch = jest.fn();
-const mockFetchWithPayment = jest.fn();
-const mockRegisterPolicy = jest.fn();
-const mockX402Client = { registerPolicy: mockRegisterPolicy };
-
-jest
-  .mocked(x402Client)
-  .mockImplementation(() => mockX402Client as unknown as InstanceType<typeof x402Client>);
-jest.mocked(wrapFetchWithPayment).mockReturnValue(mockFetchWithPayment);
-global.fetch = mockFetch;
-
-/**
- * Creates a mock Base wallet.
- *
- * @returns The mock wallet
- */
-const makeEvmWallet = () => {
-  const wallet = Object.create(EvmWalletProvider.prototype);
-  wallet.toSigner = jest.fn().mockReturnValue({ address: "0xabc" });
-  wallet.readContract = jest.fn();
-  wallet.getNetwork = jest
-    .fn()
-    .mockReturnValue({ protocolFamily: "evm", networkId: "base-mainnet" });
-  return wallet as EvmWalletProvider;
+const mockPaid = jest.fn();
+const offer = {
+  scheme: "exact",
+  network: "eip155:8453",
+  asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  amount: "40000",
 };
-
-/**
- * Creates a mock Solana wallet.
- *
- * @returns The mock wallet
- */
-const makeSvmWallet = () => {
-  const wallet = Object.create(SvmWalletProvider.prototype);
-  wallet.toSigner = jest.fn().mockResolvedValue({ address: "svm-signer" });
-  wallet.getNetwork = jest
-    .fn()
-    .mockReturnValue({ protocolFamily: "svm", networkId: "solana-mainnet" });
-  return wallet as SvmWalletProvider;
+const answer = {
+  model: "deepseek-v4.1-flash",
+  choices: [{ message: { content: "Hello" } }],
+  billing: { totalAtomic: "7" },
 };
-
+const args = { prompt: "Hello", model: null };
 /**
- * Creates a mock HTTP response with case-insensitive headers.
+ * Creates a mock response.
  *
- * @param status - HTTP status code
+ * @param status - HTTP status
  * @param body - Response body
- * @param headers - Response headers
- * @returns The mock response
+ * @param headers - HTTP headers
+ * @returns Mock response
  */
-const makeResponse = (
-  status: number,
-  body: unknown,
+const response = (
+  status = 200,
+  body: unknown = answer,
   headers: Record<string, string> = {},
 ): Response =>
   ({
     status,
     ok: status >= 200 && status < 300,
-    headers: {
-      get: (name: string) =>
-        Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1] ??
-        null,
-    },
-    text: jest.fn().mockResolvedValue(typeof body === "string" ? body : JSON.stringify(body)),
-    json: jest.fn().mockResolvedValue(body),
+    headers: new Headers(headers),
+    text: jest.fn().mockResolvedValue(JSON.stringify(body)),
   }) as unknown as Response;
-
-const BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-const SOLANA_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-
-const ANSWER = {
-  id: "chatcmpl-1",
-  model: "deepseek-v4.1-flash",
-  choices: [{ index: 0, message: { role: "assistant", content: "Hello!" } }],
-  billing: { totalAtomic: "1008", currency: "USDC" },
+/**
+ * Encodes a header as UTF-8 base64.
+ *
+ * @param value - Header object
+ * @returns Encoded header
+ */
+const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64");
+/**
+ * Simulates a 402 negotiation followed by a response or exception.
+ *
+ * @param amount - Quoted price
+ * @param result - Result after payment creation
+ */
+const handshake = (amount = "40000", result: Response | Error = response()) => {
+  let requests = 0;
+  mockFetch.mockReset().mockImplementation(async () => {
+    requests += 1;
+    if (requests % 2 === 1)
+      return response(
+        402,
+        {},
+        { "PAYMENT-REQUIRED": encode({ x402Version: 2, accepts: [{ ...offer, amount }] }) },
+      );
+    if (result instanceof Error) throw result;
+    return result;
+  });
+  mockPaid.mockImplementation(async (url, init) => {
+    const initial = await mockFetch(url, init);
+    expect(initial.status).toBe(402);
+    const requirements = mockPolicy.mock.calls[mockPolicy.mock.calls.length - 1][0](2, [
+      { ...offer, amount },
+    ]);
+    if (!requirements.length)
+      throw new Error("All payment requirements were filtered out by policies...");
+    const context = { selectedRequirements: requirements[0] };
+    const decision = await mockBefore.mock.calls[mockBefore.mock.calls.length - 1][0](context);
+    if (decision?.abort) throw new Error(decision.reason);
+    mockSign();
+    await mockAfter.mock.calls[mockAfter.mock.calls.length - 1][0](context);
+    return mockFetch(url, init);
+  });
 };
 
-describe("SingitActionProvider", () => {
-  let provider: SingitActionProvider;
-
+describe("SingIt", () => {
+  let provider: SingItActionProvider;
+  const wallet = Object.create(EvmWalletProvider.prototype);
+  wallet.toSigner = jest.fn().mockReturnValue({});
+  wallet.readContract = jest.fn();
+  wallet.getNetwork = jest
+    .fn()
+    .mockReturnValue({ protocolFamily: "evm", networkId: "base-mainnet" });
   beforeEach(() => {
     jest.clearAllMocks();
-    delete process.env.SINGIT_MAX_PAYMENT_USDC;
-    jest.mocked(wrapFetchWithPayment).mockReturnValue(mockFetchWithPayment);
-    provider = new SingitActionProvider();
+    mockPaid.mockReset();
+    jest.mocked(x402Client).mockImplementation(
+      () =>
+        ({
+          registerPolicy: mockPolicy,
+          onBeforePaymentCreation: mockBefore,
+          onAfterPaymentCreation: mockAfter,
+        }) as unknown as x402Client,
+    );
+    jest.mocked(wrapFetchWithPayment).mockReturnValue(mockPaid);
+    global.fetch = mockFetch;
+    provider = singitActionProvider({ maxPerCallUsd: 0.05, maxPerDayUsd: 0.08 });
+    handshake();
   });
-
-  describe("constructor", () => {
-    it("exposes a factory", () => {
-      expect(singitActionProvider()).toBeInstanceOf(SingitActionProvider);
+  afterEach(() => jest.useRealTimers());
+  it("refuses an excessive quote without signing or counting", async () => {
+    handshake("50001");
+    expect(JSON.parse(await provider.ask(wallet, args))).toMatchObject({
+      refused: true,
+      chargedAtomic: "0",
     });
-
-    it("rejects a negative payment limit", () => {
-      expect(() => new SingitActionProvider({ maxPaymentUsdc: -1 })).toThrow();
-    });
-
-    it.each(["0.05oops", "1,000", "-1", "abc"])("rejects invalid environment limit %s", value => {
-      process.env.SINGIT_MAX_PAYMENT_USDC = value;
-      expect(() => new SingitActionProvider()).toThrow(
-        "SingIt SINGIT_MAX_PAYMENT_USDC must be a non-negative number",
-      );
-    });
-
-    it.each([NaN, Infinity, -Infinity])("rejects non-finite limit %s", maxPaymentUsdc => {
-      expect(() => new SingitActionProvider({ maxPaymentUsdc })).toThrow(
-        "SingIt maxPaymentUsdc must be a non-negative number",
-      );
-    });
-
-    it("rejects numeric limits at or above 1e21", () => {
-      expect(() => new SingitActionProvider({ maxPaymentUsdc: 1e21 })).toThrow(
-        "SingIt maxPaymentUsdc must be less than 1e21",
-      );
-    });
-
-    it("gives explicit configuration precedence over an invalid environment limit", () => {
-      process.env.SINGIT_MAX_PAYMENT_USDC = "oops";
-      expect(() => new SingitActionProvider({ maxPaymentUsdc: 0.07 })).not.toThrow();
-    });
+    expect(mockSign).not.toHaveBeenCalled();
+    expect(JSON.parse(await provider.spendStatus(wallet, {})).spentTodayUsd).toBe(0);
   });
-
-  describe("supportsNetwork", () => {
-    it("supports Base and Solana mainnet", () => {
-      expect(provider.supportsNetwork({ protocolFamily: "evm", networkId: "base-mainnet" })).toBe(
-        true,
-      );
-      expect(provider.supportsNetwork({ protocolFamily: "svm", networkId: "solana-mainnet" })).toBe(
-        true,
-      );
+  it.each([false, true])("enforces daily totals, concurrent=%s", async concurrent => {
+    const results = concurrent
+      ? await Promise.all([
+          provider.ask(wallet, args),
+          provider.ask(wallet, args),
+          provider.ask(wallet, args),
+        ])
+      : [
+          await provider.ask(wallet, args),
+          await provider.ask(wallet, args),
+          await provider.ask(wallet, args),
+        ];
+    expect(results.map(value => JSON.parse(value).chargedAtomic)).toEqual(["40000", "40000", "0"]);
+    expect(mockSign).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(await provider.spendStatus(wallet, {})).spentTodayUsd).toBe(0.08);
+  });
+  it("returns an answer and sends the fixed request", async () => {
+    expect(JSON.parse(await provider.ask(wallet, args))).toMatchObject({
+      success: true,
+      answer: "Hello",
+      model: answer.model,
+      billing: answer.billing,
+      chargedAtomic: "40000",
+      chargedUsd: 0.04,
     });
-
-    it("does not support testnets or other networks", () => {
-      expect(provider.supportsNetwork({ protocolFamily: "evm", networkId: "base-sepolia" })).toBe(
-        false,
-      );
-      expect(
-        provider.supportsNetwork({ protocolFamily: "evm", networkId: "ethereum-mainnet" }),
-      ).toBe(false);
-      expect(provider.supportsNetwork({ protocolFamily: "evm" })).toBe(false);
+    expect(mockPaid.mock.calls[0][0]).toBe("https://ask.singitai.app/v1/chat/completions");
+    expect(JSON.parse(mockPaid.mock.calls[0][1].body)).toEqual({
+      model: answer.model,
+      max_tokens: 800,
+      messages: [{ role: "user", content: "Hello" }],
     });
   });
-
-  describe("list_models", () => {
-    it("returns the models with prices and no unrelated fields", async () => {
-      mockFetch.mockResolvedValue(
-        makeResponse(200, {
-          data: [
-            {
-              id: "deepseek-v4.1-flash",
-              name: "DeepSeek V4.1 Flash",
-              tags: ["reasoning"],
-              singitUsdPerMillionTokens: { input: 0.1, output: 0.2 },
-              owned_by: "DeepSeek",
-            },
-            { id: "free/deepseek-v4.1-flash", free: true },
-          ],
-        }),
-      );
-
-      const result = JSON.parse(await provider.listModels(makeEvmWallet(), {}));
-
-      expect(mockFetch).toHaveBeenCalledWith(
-        "https://ask.singitai.app/v1/models",
-        expect.any(Object),
-      );
-      expect(result.success).toBe(true);
-      expect(result.models).toHaveLength(2);
-      expect(result.models[0]).toMatchObject({
-        id: "deepseek-v4.1-flash",
-        usdPerMillionTokens: { input: 0.1, output: 0.2 },
-      });
-      expect(result.models[0].owned_by).toBeUndefined();
-      expect(result.models[1].free).toBe(true);
+  it("passes through search results and uses the configured URL", async () => {
+    provider = singitActionProvider({
+      maxPerCallUsd: 0.05,
+      maxPerDayUsd: 1,
+      baseUrl: "http://localhost:3000/",
     });
-
-    it("reports a non-200 status", async () => {
-      mockFetch.mockResolvedValue(makeResponse(503, "down"));
-      const result = JSON.parse(await provider.listModels(makeEvmWallet(), {}));
-      expect(result.error).toBe(true);
-      expect(result.message).toContain("503");
-    });
-
-    it("reports a network failure", async () => {
-      mockFetch.mockRejectedValue(new Error("boom"));
-      const result = JSON.parse(await provider.listModels(makeEvmWallet(), {}));
-      expect(result.error).toBe(true);
-      expect(result.message).toContain("boom");
-    });
+    const results = [{ title: "é", extra: [1] }];
+    handshake("40000", response(200, { results, billing: { price: 1 } }));
+    expect(
+      JSON.parse(await provider.search(wallet, { query: "q", numResults: null })),
+    ).toMatchObject({ results, billing: { price: 1 }, chargedAtomic: "40000" });
+    expect(mockPaid.mock.calls[0][0]).toBe("http://localhost:3000/v1/exa/search");
+    expect(JSON.parse(mockPaid.mock.calls[0][1].body)).toEqual({ query: "q", numResults: 5 });
   });
-
-  describe("ask", () => {
-    const args = { prompt: "Hello", model: null, system: null, maxTokens: null };
-
-    it("pays with an EVM wallet and returns the answer and billing", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
-
-      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-
-      expect(registerExactEvmScheme).toHaveBeenCalled();
-      expect(registerExactSvmScheme).not.toHaveBeenCalled();
-      expect(mockFetchWithPayment).toHaveBeenCalledTimes(1);
-      const [url, init] = mockFetchWithPayment.mock.calls[0];
-      expect(url).toBe("https://ask.singitai.app/v1/chat/completions");
-      expect(init.method).toBe("POST");
-      expect(JSON.parse(init.body)).toEqual({
-        model: "deepseek-v4.1-flash",
-        max_tokens: 800,
-        messages: [{ role: "user", content: "Hello" }],
-      });
-      expect(result).toEqual({
-        success: true,
-        model: "deepseek-v4.1-flash",
-        answer: "Hello!",
-        billing: { totalAtomic: "1008", currency: "USDC" },
-      });
-    });
-
-    it("pays with a Solana wallet", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
-
-      const result = JSON.parse(await provider.ask(makeSvmWallet(), args));
-
-      expect(registerExactSvmScheme).toHaveBeenCalled();
-      expect(registerExactEvmScheme).not.toHaveBeenCalled();
-      expect(result.success).toBe(true);
-    });
-
-    it("sends the system message, model and token limit", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
-
-      await provider.ask(makeEvmWallet(), {
-        prompt: "Hi",
-        model: "gpt-5.5",
-        system: "Be brief.",
-        maxTokens: 100,
-      });
-
-      const body = JSON.parse(mockFetchWithPayment.mock.calls[0][1].body);
-      expect(body.model).toBe("gpt-5.5");
-      expect(body.max_tokens).toBe(100);
-      expect(body.messages).toEqual([
-        { role: "system", content: "Be brief." },
-        { role: "user", content: "Hi" },
-      ]);
-    });
-
-    it("registers a policy that only signs exact offers within the limit", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
-      provider = new SingitActionProvider({ maxPaymentUsdc: 0.01 });
-
-      await provider.ask(makeEvmWallet(), args);
-
-      const policy = mockRegisterPolicy.mock.calls[0][0];
-      /**
-       * Creates a payment offer for the policy.
-       *
-       * @param over - Offer overrides
-       * @returns The payment offer
-       */
-      const offer = (over: Record<string, string>) => ({
-        scheme: "exact",
-        network: "eip155:8453",
-        asset: BASE_USDC,
-        amount: "1500",
-        ...over,
-      });
-      const offers = [
-        offer({ scheme: "upto" }),
-        offer({}),
-        offer({ amount: "10000" }),
-        offer({ amount: "10001" }),
-        offer({ amount: "-1" }),
-        offer({ network: "eip155:1" }),
-        offer({ asset: "0x0000000000000000000000000000000000000001" }),
-      ];
-      expect(policy(2, offers)).toEqual([offer({}), offer({ amount: "10000" })]);
-    });
-
-    it("takes the payment limit from the environment", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
-      process.env.SINGIT_MAX_PAYMENT_USDC = "0.002";
-      provider = new SingitActionProvider();
-
-      await provider.ask(makeEvmWallet(), args);
-
-      const policy = mockRegisterPolicy.mock.calls[0][0];
-      /**
-       * Creates a payment offer for the policy.
-       *
-       * @param amount - Atomic payment amount
-       * @returns The payment offer
-       */
-      const offer = (amount: string) => ({
-        scheme: "exact",
-        network: "eip155:8453",
-        asset: BASE_USDC,
-        amount,
-      });
-      expect(policy(2, [offer("2001")])).toEqual([]);
-      expect(policy(2, [offer("2000")])).toHaveLength(1);
-    });
-
-    it.each([0.0000006, 0.0000009999999, 1e-7])("never rounds limit %s up", async limit => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
-      provider = new SingitActionProvider({ maxPaymentUsdc: limit });
-
-      await provider.ask(makeEvmWallet(), args);
-
-      const policy = mockRegisterPolicy.mock.calls[0][0];
-      const offer = { scheme: "exact", network: "eip155:8453", asset: BASE_USDC, amount: "1" };
-      expect(policy(2, [offer])).toEqual([]);
-    });
-
-    it("truncates the payment limit to whole micro-USDC", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
-      provider = new SingitActionProvider({ maxPaymentUsdc: 0.0000019 });
-
-      await provider.ask(makeEvmWallet(), args);
-
-      const policy = mockRegisterPolicy.mock.calls[0][0];
-      /**
-       * Creates a payment offer for the policy.
-       *
-       * @param amount - Atomic payment amount
-       * @returns The payment offer
-       */
-      const offer = (amount: string) => ({
-        scheme: "exact",
-        network: "eip155:8453",
-        asset: BASE_USDC,
-        amount,
-      });
-      expect(policy(2, [offer("1")])).toHaveLength(1);
-      expect(policy(2, [offer("2")])).toEqual([]);
-    });
-
-    it("keeps a limit such as 0.07 exact", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
-      provider = new SingitActionProvider({ maxPaymentUsdc: 0.07 });
-
-      await provider.ask(makeEvmWallet(), args);
-
-      const policy = mockRegisterPolicy.mock.calls[0][0];
-      /**
-       * Creates a payment offer for the policy.
-       *
-       * @param amount - Atomic payment amount
-       * @returns The payment offer
-       */
-      const offer = (amount: string) => ({
-        scheme: "exact",
-        network: "eip155:8453",
-        asset: BASE_USDC,
-        amount,
-      });
-      expect(policy(2, [offer("70000")])).toHaveLength(1);
-      expect(policy(2, [offer("70001")])).toEqual([]);
-    });
-
-    it.each([
-      ["", "50000"],
-      ["  ", "50000"],
-      [" 0.07 ", "70000"],
-      ["0.000000999999999999999999", "0"],
-      ["0.070000999999999999999999", "70000"],
-    ])("floors environment limit %s exactly", async (value, atomic) => {
-      process.env.SINGIT_MAX_PAYMENT_USDC = value;
-      provider = new SingitActionProvider();
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
-      await provider.ask(makeEvmWallet(), args);
-      const policy = mockRegisterPolicy.mock.calls[0][0];
-      const offer = {
-        scheme: "exact",
-        network: "eip155:8453",
-        asset: BASE_USDC,
-        amount: atomic,
-      };
-      expect(policy(2, [offer])).toEqual([offer]);
-      expect(policy(2, [{ ...offer, amount: String(BigInt(atomic) + 1n) }])).toEqual([]);
-    });
-
-    it.each([200, 502])("includes decoded settlement on status %s", async status => {
-      const settlement = {
-        success: true,
-        transaction: "0x123",
-        network: "eip155:8453",
-        errorReason: "gateway_error",
-      };
-      mockFetchWithPayment.mockResolvedValue(
-        makeResponse(status, status === 200 ? ANSWER : {}, {
-          "PAYMENT-RESPONSE": btoa(JSON.stringify({ ...settlement, extra: "ignored" })),
-        }),
-      );
-      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-      expect(result.settlement).toEqual(settlement);
-    });
-
-    it("preserves settlement when reading the answer fails", async () => {
-      const settlement = { success: true, transaction: "0x123", network: "eip155:8453" };
-      const response = makeResponse(200, ANSWER, {
-        "PAYMENT-RESPONSE": btoa(JSON.stringify(settlement)),
-      });
-      jest.mocked(response.text).mockRejectedValue(new Error("connection reset"));
-      mockFetchWithPayment.mockResolvedValue(response);
-
-      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-
-      expect(result.error).toBe(true);
-      expect(result.settlement).toEqual(settlement);
-      expect(result.message).toContain("could not be read");
-      expect(result.message).toContain("payment may have been charged");
-      expect(result.message).toContain("connection reset");
-    });
-
-    it("decodes UTF-8 error reasons in both payment headers", async () => {
-      const settlement = { success: false, errorReason: "échec" };
-      mockFetchWithPayment.mockResolvedValue(
-        makeResponse(
-          402,
+  it.each([false, true])(
+    "counts HTTP failures only when settlement succeeds: %s",
+    async success => {
+      handshake(
+        "40000",
+        response(
+          503,
           {},
           {
-            "PAYMENT-RESPONSE": Buffer.from(JSON.stringify(settlement), "utf8").toString("base64"),
-            "PAYMENT-REQUIRED": Buffer.from(
-              JSON.stringify({ x402Version: 2, error: "échec" }),
-              "utf8",
-            ).toString("base64"),
+            "PAYMENT-RESPONSE": encode({ success, errorReason: "échec" }),
+            "PAYMENT-REQUIRED": encode({ error: "支付失败" }),
           },
         ),
       );
-
-      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-
-      expect(result.error).toBe(true);
-      expect(result.settlement).toEqual(settlement);
-      expect(result.paymentError).toBe("échec");
-    });
-
-    it("accepts lowercase settlement headers and filters invalid field types", async () => {
-      mockFetchWithPayment.mockResolvedValue(
-        makeResponse(200, ANSWER, {
-          "payment-response": btoa(
-            JSON.stringify({
-              success: false,
-              transaction: 123,
-              network: null,
-              errorReason: {},
-            }),
-          ),
-        }),
+      expect(JSON.parse(await provider.ask(wallet, args))).toMatchObject({
+        chargedAtomic: success ? "40000" : "0",
+        settlement: { success, errorReason: "échec" },
+        paymentError: "支付失败",
+      });
+      expect(JSON.parse(await provider.spendStatus(wallet, {})).spentTodayUsd).toBe(
+        success ? 0.04 : 0,
       );
-      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-      expect(result.settlement).toEqual({ success: false });
-    });
-
-    it.each(["not base64!", btoa("not JSON"), btoa("null"), btoa("[]")])(
-      "ignores malformed settlement %s",
-      async header => {
-        mockFetchWithPayment.mockResolvedValue(
-          makeResponse(200, ANSWER, { "payment-response": header }),
-        );
-        const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-        expect(result.success).toBe(true);
-        expect(result.settlement).toBeUndefined();
-      },
+    },
+  );
+  it.each([503, 502, 504, 524, 400, 519, 520, 530, 531])(
+    "accounts for unsettled HTTP status %s",
+    async status => {
+      const uncertain = [502, 504, 524, 520, 530].includes(status);
+      handshake("40000", response(status));
+      const result = JSON.parse(await provider.ask(wallet, args));
+      expect(result.chargedAtomic).toBe(uncertain ? "40000" : "0");
+      expect(result.chargedUsd).toBe(uncertain ? 0.04 : 0);
+      expect(result.message.includes("outcome unknown, counted against today's ceiling")).toBe(
+        uncertain,
+      );
+      expect(JSON.parse(await provider.spendStatus(wallet, {})).spentTodayUsd).toBe(
+        uncertain ? 0.04 : 0,
+      );
+    },
+  );
+  it.each([502, 504, 524])("counts unreadable proxy failure %s once", async status => {
+    const res = response(status);
+    jest.mocked(res.text).mockRejectedValue(new Error("unreadable"));
+    handshake("40000", res);
+    const result = JSON.parse(await provider.ask(wallet, args));
+    expect(result.chargedAtomic).toBe("40000");
+    expect(result.message).toContain("outcome unknown, counted against today's ceiling");
+    expect(JSON.parse(await provider.spendStatus(wallet, {})).spentTodayUsd).toBe(0.04);
+  });
+  it("counts exceptions after signing conservatively", async () => {
+    handshake("40000", new Error("timeout"));
+    expect(JSON.parse(await provider.ask(wallet, args)).message).toContain(
+      "outcome unknown, counted against today's ceiling",
     );
-
-    it("only signs Solana USDC offers for a Solana wallet", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
-
-      await provider.ask(makeSvmWallet(), args);
-
-      const policy = mockRegisterPolicy.mock.calls[0][0];
-      const solana = {
-        scheme: "exact",
-        network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-        asset: SOLANA_USDC,
-        amount: "2002",
-      };
-      expect(policy(2, [solana])).toEqual([solana]);
-      expect(policy(2, [{ ...solana, asset: "SomeOtherMint" }])).toEqual([]);
-      expect(policy(2, [{ ...solana, network: "eip155:8453", asset: BASE_USDC }])).toEqual([]);
+    expect(JSON.parse(await provider.spendStatus(wallet, {})).spentTodayUsd).toBe(0.04);
+  });
+  it("counts unreadable responses once", async () => {
+    const res = response();
+    jest.mocked(res.text).mockRejectedValue(new Error("unreadable"));
+    handshake("40000", res);
+    expect(JSON.parse(await provider.ask(wallet, args)).chargedAtomic).toBe("40000");
+    expect(JSON.parse(await provider.spendStatus(wallet, {})).spentTodayUsd).toBe(0.04);
+  });
+  it("counts nothing before signing", async () => {
+    mockPaid.mockRejectedValue(new Error("offline"));
+    expect(JSON.parse(await provider.ask(wallet, args)).chargedAtomic).toBe("0");
+  });
+  it("bypasses payments for the free model", async () => {
+    mockFetch.mockResolvedValue(response());
+    expect(
+      JSON.parse(await provider.ask(wallet, { ...args, model: "free/deepseek-v4.1-flash" }))
+        .chargedAtomic,
+    ).toBe("0");
+    expect(x402Client).not.toHaveBeenCalled();
+    expect(JSON.parse(await provider.spendStatus(wallet, {})).spentTodayUsd).toBe(0);
+  });
+  it("filters invalid offers and guards payment creation", async () => {
+    await provider.ask(wallet, args);
+    for (const override of [
+      { scheme: "upto" },
+      { network: "eip155:1" },
+      { asset: "other" },
+      { amount: "-1" },
+      { amount: "1.5" },
+    ])
+      expect(mockPolicy.mock.calls[0][0](2, [{ ...offer, ...override }])).toEqual([]);
+    expect(
+      await mockBefore.mock.calls[0][0]({ selectedRequirements: { ...offer, amount: "50001" } }),
+    ).toMatchObject({ abort: true });
+  });
+  it("keeps 0.07 exact", async () => {
+    provider = singitActionProvider({ maxPerCallUsd: 0.07, maxPerDayUsd: 1 });
+    handshake("70000");
+    expect(JSON.parse(await provider.ask(wallet, args)).chargedAtomic).toBe("70000");
+    expect(mockPolicy.mock.calls[0][0](2, [{ ...offer, amount: "70001" }])).toEqual([]);
+  });
+  it.each([undefined, 0, -1, NaN, Infinity])("rejects invalid ceilings %s", value => {
+    expect(() =>
+      singitActionProvider({ maxPerCallUsd: value, maxPerDayUsd: 1 } as SingItConfig),
+    ).toThrow();
+    expect(() =>
+      singitActionProvider({ maxPerCallUsd: 0.05, maxPerDayUsd: value } as SingItConfig),
+    ).toThrow();
+  });
+  it("rejects missing config, reversed limits, and invalid scales", () => {
+    expect(() => singitActionProvider(undefined as never)).toThrow();
+    expect(() => singitActionProvider({ maxPerCallUsd: 2, maxPerDayUsd: 1 })).toThrow();
+    expect(() => singitActionProvider({ maxPerCallUsd: 1e21, maxPerDayUsd: 1e21 })).toThrow(
+      "less than 1e21",
+    );
+    expect(() => singitActionProvider({ maxPerCallUsd: 0.0000009999999, maxPerDayUsd: 1 })).toThrow(
+      "must be at least 0.000001",
+    );
+  });
+  it.each(["bad", "http://example.com", "ftp://localhost"])("rejects URL %s", baseUrl => {
+    expect(() => singitActionProvider({ maxPerCallUsd: 1, maxPerDayUsd: 1, baseUrl })).toThrow();
+  });
+  it("supports Base mainnet only", () => {
+    expect(provider.supportsNetwork({ protocolFamily: "evm", networkId: "base-mainnet" })).toBe(
+      true,
+    );
+    for (const networkId of ["base-sepolia", "ethereum-mainnet", "solana-mainnet"])
+      expect(provider.supportsNetwork({ protocolFamily: "evm", networkId })).toBe(false);
+    expect(provider.supportsNetwork({ protocolFamily: "svm", networkId: "solana-mainnet" })).toBe(
+      false,
+    );
+  });
+  it("reports local status and resets at midnight UTC", async () => {
+    jest.useFakeTimers().setSystemTime(new Date("2026-11-05T23:59:59Z"));
+    await provider.ask(wallet, args);
+    expect(JSON.parse(await provider.spendStatus(wallet, {}))).toEqual({
+      success: true,
+      spentTodayUsd: 0.04,
+      remainingTodayUsd: 0.04,
+      maxPerCallUsd: 0.05,
+      maxPerDayUsd: 0.08,
+      day: "2026-11-05",
+      resetsAt: "2026-11-06T00:00:00.000Z",
     });
-
-    it("returns an error for a non-200 answer", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(402, { error: "Payment required" }));
-
-      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-
-      expect(result.error).toBe(true);
-      expect(result.message).toBe("SingIt Ask returned status 402.");
-      expect(result.details).toEqual({ error: "Payment required" });
+    jest.setSystemTime(new Date("2026-11-06T00:00:00Z"));
+    expect(JSON.parse(await provider.spendStatus(wallet, {}))).toMatchObject({
+      spentTodayUsd: 0,
+      day: "2026-11-06",
     });
-
-    it("surfaces the reason from the PAYMENT-REQUIRED header on a refused payment", async () => {
-      const header = btoa(JSON.stringify({ x402Version: 2, error: "insufficient_funds" }));
-      mockFetchWithPayment.mockResolvedValue(makeResponse(402, {}, { "payment-required": header }));
-
-      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-
-      expect(result.error).toBe(true);
-      expect(result.paymentError).toBe("insufficient_funds");
-    });
-
-    it("returns an error for a non-JSON failure", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(502, "bad gateway"));
-
-      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-
-      expect(result.error).toBe(true);
-      expect(result.details).toBe("bad gateway");
-    });
-
-    it("returns an error when the payment client throws", async () => {
-      mockFetchWithPayment.mockRejectedValue(new Error("No supported payment option"));
-
-      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-
-      expect(result.error).toBe(true);
-      expect(result.message).toContain("No supported payment option");
-    });
-
-    it("returns an error when a 200 response has no answer", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, { billing: { totalAtomic: "5" } }));
-
-      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-
-      expect(result.error).toBe(true);
-      expect(result.success).toBeUndefined();
-      expect(result.billing).toEqual({ totalAtomic: "5" });
-    });
-
-    it("returns an error when a 200 response is not JSON", async () => {
-      mockFetchWithPayment.mockResolvedValue(makeResponse(200, "<html></html>"));
-
-      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
-
-      expect(result.error).toBe(true);
-    });
-
-    it("rejects an unsupported wallet provider", async () => {
-      const result = JSON.parse(await provider.ask({} as never, args));
-
-      expect(result.error).toBe(true);
-      expect(result.message).toBe("Unsupported wallet provider");
-      expect(mockFetchWithPayment).not.toHaveBeenCalled();
-    });
+    expect(mockPaid).toHaveBeenCalledTimes(1);
+  });
+  it.each(["not base64!", encode(null), encode([])])(
+    "ignores malformed settlement %s",
+    async header => {
+      handshake("1", response(200, answer, { "payment-response": header }));
+      expect(JSON.parse(await provider.ask(wallet, args)).settlement).toBeUndefined();
+    },
+  );
+  it("rejects non-EVM providers", async () => {
+    expect(JSON.parse(await provider.ask({} as never, args)).error).toBe(true);
+    expect(mockPaid).not.toHaveBeenCalled();
+  });
+  it("returns the parsed search body if results are absent", async () => {
+    handshake("1", response(200, { value: [1, 2] }));
+    expect(
+      JSON.parse(await provider.search(wallet, { query: "q", numResults: 2 })).results,
+    ).toEqual({ value: [1, 2] });
+  });
+  it("floors fractional atomic units without rounding", async () => {
+    provider = singitActionProvider({ maxPerCallUsd: 0.0000019, maxPerDayUsd: 1 });
+    handshake("1");
+    expect(JSON.parse(await provider.ask(wallet, args)).chargedAtomic).toBe("1");
+    expect(mockPolicy.mock.calls[0][0](2, [{ ...offer, amount: "2" }])).toEqual([]);
+  });
+  it("validates prompt and search schema boundaries", () => {
+    for (const prompt of ["", "x".repeat(20001)])
+      expect(AskSchema.safeParse({ prompt, model: null }).success).toBe(false);
+    for (const query of ["", "x".repeat(2001)])
+      expect(SearchSchema.safeParse({ query, numResults: null }).success).toBe(false);
+    for (const numResults of [0, 26, 1.5])
+      expect(SearchSchema.safeParse({ query: "q", numResults }).success).toBe(false);
+    expect(SearchSchema.safeParse({ query: "q", numResults: 25 }).success).toBe(true);
+  });
+  it("does not count an unsettled failure whose body cannot be read", async () => {
+    const res = response(503);
+    jest.mocked(res.text).mockRejectedValue(new Error("unreadable"));
+    handshake("40000", res);
+    expect(JSON.parse(await provider.ask(wallet, args)).chargedAtomic).toBe("0");
+    expect(JSON.parse(await provider.spendStatus(wallet, {})).spentTodayUsd).toBe(0);
+  });
+  it("treats every free/ model id as free", async () => {
+    mockFetch.mockResolvedValue(response());
+    await provider.ask(wallet, { ...args, model: "free/other-model" });
+    expect(x402Client).not.toHaveBeenCalled();
   });
 });
