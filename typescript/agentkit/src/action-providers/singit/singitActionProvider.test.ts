@@ -19,6 +19,11 @@ jest
 jest.mocked(wrapFetchWithPayment).mockReturnValue(mockFetchWithPayment);
 global.fetch = mockFetch;
 
+/**
+ * Creates a mock Base wallet.
+ *
+ * @returns The mock wallet
+ */
 const makeEvmWallet = () => {
   const wallet = Object.create(EvmWalletProvider.prototype);
   wallet.toSigner = jest.fn().mockReturnValue({ address: "0xabc" });
@@ -29,6 +34,11 @@ const makeEvmWallet = () => {
   return wallet as EvmWalletProvider;
 };
 
+/**
+ * Creates a mock Solana wallet.
+ *
+ * @returns The mock wallet
+ */
 const makeSvmWallet = () => {
   const wallet = Object.create(SvmWalletProvider.prototype);
   wallet.toSigner = jest.fn().mockResolvedValue({ address: "svm-signer" });
@@ -38,6 +48,14 @@ const makeSvmWallet = () => {
   return wallet as SvmWalletProvider;
 };
 
+/**
+ * Creates a mock HTTP response with case-insensitive headers.
+ *
+ * @param status - HTTP status code
+ * @param body - Response body
+ * @param headers - Response headers
+ * @returns The mock response
+ */
 const makeResponse = (
   status: number,
   body: unknown,
@@ -46,7 +64,11 @@ const makeResponse = (
   ({
     status,
     ok: status >= 200 && status < 300,
-    headers: { get: (name: string) => headers[name.toLowerCase()] ?? null },
+    headers: {
+      get: (name: string) =>
+        Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1] ??
+        null,
+    },
     text: jest.fn().mockResolvedValue(typeof body === "string" ? body : JSON.stringify(body)),
     json: jest.fn().mockResolvedValue(body),
   }) as unknown as Response;
@@ -80,9 +102,28 @@ describe("SingitActionProvider", () => {
       expect(() => new SingitActionProvider({ maxPaymentUsdc: -1 })).toThrow();
     });
 
-    it("rejects a non-numeric payment limit from the environment", () => {
-      process.env.SINGIT_MAX_PAYMENT_USDC = "abc";
-      expect(() => new SingitActionProvider()).toThrow();
+    it.each(["0.05oops", "1,000", "-1", "abc"])("rejects invalid environment limit %s", value => {
+      process.env.SINGIT_MAX_PAYMENT_USDC = value;
+      expect(() => new SingitActionProvider()).toThrow(
+        "SingIt SINGIT_MAX_PAYMENT_USDC must be a non-negative number",
+      );
+    });
+
+    it.each([NaN, Infinity, -Infinity])("rejects non-finite limit %s", maxPaymentUsdc => {
+      expect(() => new SingitActionProvider({ maxPaymentUsdc })).toThrow(
+        "SingIt maxPaymentUsdc must be a non-negative number",
+      );
+    });
+
+    it("rejects numeric limits at or above 1e21", () => {
+      expect(() => new SingitActionProvider({ maxPaymentUsdc: 1e21 })).toThrow(
+        "SingIt maxPaymentUsdc must be less than 1e21",
+      );
+    });
+
+    it("gives explicit configuration precedence over an invalid environment limit", () => {
+      process.env.SINGIT_MAX_PAYMENT_USDC = "oops";
+      expect(() => new SingitActionProvider({ maxPaymentUsdc: 0.07 })).not.toThrow();
     });
   });
 
@@ -218,6 +259,12 @@ describe("SingitActionProvider", () => {
       await provider.ask(makeEvmWallet(), args);
 
       const policy = mockRegisterPolicy.mock.calls[0][0];
+      /**
+       * Creates a payment offer for the policy.
+       *
+       * @param over - Offer overrides
+       * @returns The payment offer
+       */
       const offer = (over: Record<string, string>) => ({
         scheme: "exact",
         network: "eip155:8453",
@@ -245,6 +292,12 @@ describe("SingitActionProvider", () => {
       await provider.ask(makeEvmWallet(), args);
 
       const policy = mockRegisterPolicy.mock.calls[0][0];
+      /**
+       * Creates a payment offer for the policy.
+       *
+       * @param amount - Atomic payment amount
+       * @returns The payment offer
+       */
       const offer = (amount: string) => ({
         scheme: "exact",
         network: "eip155:8453",
@@ -255,9 +308,9 @@ describe("SingitActionProvider", () => {
       expect(policy(2, [offer("2000")])).toHaveLength(1);
     });
 
-    it("never rounds the payment limit up", async () => {
+    it.each([0.0000006, 0.0000009999999, 1e-7])("never rounds limit %s up", async limit => {
       mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
-      provider = new SingitActionProvider({ maxPaymentUsdc: 0.0000006 });
+      provider = new SingitActionProvider({ maxPaymentUsdc: limit });
 
       await provider.ask(makeEvmWallet(), args);
 
@@ -273,6 +326,12 @@ describe("SingitActionProvider", () => {
       await provider.ask(makeEvmWallet(), args);
 
       const policy = mockRegisterPolicy.mock.calls[0][0];
+      /**
+       * Creates a payment offer for the policy.
+       *
+       * @param amount - Atomic payment amount
+       * @returns The payment offer
+       */
       const offer = (amount: string) => ({
         scheme: "exact",
         network: "eip155:8453",
@@ -290,6 +349,12 @@ describe("SingitActionProvider", () => {
       await provider.ask(makeEvmWallet(), args);
 
       const policy = mockRegisterPolicy.mock.calls[0][0];
+      /**
+       * Creates a payment offer for the policy.
+       *
+       * @param amount - Atomic payment amount
+       * @returns The payment offer
+       */
       const offer = (amount: string) => ({
         scheme: "exact",
         network: "eip155:8453",
@@ -299,6 +364,113 @@ describe("SingitActionProvider", () => {
       expect(policy(2, [offer("70000")])).toHaveLength(1);
       expect(policy(2, [offer("70001")])).toEqual([]);
     });
+
+    it.each([
+      ["", "50000"],
+      ["  ", "50000"],
+      [" 0.07 ", "70000"],
+      ["0.000000999999999999999999", "0"],
+      ["0.070000999999999999999999", "70000"],
+    ])("floors environment limit %s exactly", async (value, atomic) => {
+      process.env.SINGIT_MAX_PAYMENT_USDC = value;
+      provider = new SingitActionProvider();
+      mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
+      await provider.ask(makeEvmWallet(), args);
+      const policy = mockRegisterPolicy.mock.calls[0][0];
+      const offer = {
+        scheme: "exact",
+        network: "eip155:8453",
+        asset: BASE_USDC,
+        amount: atomic,
+      };
+      expect(policy(2, [offer])).toEqual([offer]);
+      expect(policy(2, [{ ...offer, amount: String(BigInt(atomic) + 1n) }])).toEqual([]);
+    });
+
+    it.each([200, 502])("includes decoded settlement on status %s", async status => {
+      const settlement = {
+        success: true,
+        transaction: "0x123",
+        network: "eip155:8453",
+        errorReason: "gateway_error",
+      };
+      mockFetchWithPayment.mockResolvedValue(
+        makeResponse(status, status === 200 ? ANSWER : {}, {
+          "PAYMENT-RESPONSE": btoa(JSON.stringify({ ...settlement, extra: "ignored" })),
+        }),
+      );
+      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
+      expect(result.settlement).toEqual(settlement);
+    });
+
+    it("preserves settlement when reading the answer fails", async () => {
+      const settlement = { success: true, transaction: "0x123", network: "eip155:8453" };
+      const response = makeResponse(200, ANSWER, {
+        "PAYMENT-RESPONSE": btoa(JSON.stringify(settlement)),
+      });
+      jest.mocked(response.text).mockRejectedValue(new Error("connection reset"));
+      mockFetchWithPayment.mockResolvedValue(response);
+
+      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
+
+      expect(result.error).toBe(true);
+      expect(result.settlement).toEqual(settlement);
+      expect(result.message).toContain("could not be read");
+      expect(result.message).toContain("payment may have been charged");
+      expect(result.message).toContain("connection reset");
+    });
+
+    it("decodes UTF-8 error reasons in both payment headers", async () => {
+      const settlement = { success: false, errorReason: "échec" };
+      mockFetchWithPayment.mockResolvedValue(
+        makeResponse(
+          402,
+          {},
+          {
+            "PAYMENT-RESPONSE": Buffer.from(JSON.stringify(settlement), "utf8").toString("base64"),
+            "PAYMENT-REQUIRED": Buffer.from(
+              JSON.stringify({ x402Version: 2, error: "échec" }),
+              "utf8",
+            ).toString("base64"),
+          },
+        ),
+      );
+
+      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
+
+      expect(result.error).toBe(true);
+      expect(result.settlement).toEqual(settlement);
+      expect(result.paymentError).toBe("échec");
+    });
+
+    it("accepts lowercase settlement headers and filters invalid field types", async () => {
+      mockFetchWithPayment.mockResolvedValue(
+        makeResponse(200, ANSWER, {
+          "payment-response": btoa(
+            JSON.stringify({
+              success: false,
+              transaction: 123,
+              network: null,
+              errorReason: {},
+            }),
+          ),
+        }),
+      );
+      const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
+      expect(result.settlement).toEqual({ success: false });
+    });
+
+    it.each(["not base64!", btoa("not JSON"), btoa("null"), btoa("[]")])(
+      "ignores malformed settlement %s",
+      async header => {
+        mockFetchWithPayment.mockResolvedValue(
+          makeResponse(200, ANSWER, { "payment-response": header }),
+        );
+        const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
+        expect(result.success).toBe(true);
+        expect(result.settlement).toBeUndefined();
+      },
+    );
 
     it("only signs Solana USDC offers for a Solana wallet", async () => {
       mockFetchWithPayment.mockResolvedValue(makeResponse(200, ANSWER));
@@ -323,7 +495,7 @@ describe("SingitActionProvider", () => {
       const result = JSON.parse(await provider.ask(makeEvmWallet(), args));
 
       expect(result.error).toBe(true);
-      expect(result.message).toContain("402");
+      expect(result.message).toBe("SingIt Ask returned status 402.");
       expect(result.details).toEqual({ error: "Payment required" });
     });
 

@@ -31,18 +31,27 @@ export class SingitActionProvider extends ActionProvider<WalletProvider> {
    */
   constructor(config: SingitConfig = {}) {
     super("singit", []);
-    const maxPaymentUsdc =
-      config.maxPaymentUsdc ??
-      parseFloat(process.env.SINGIT_MAX_PAYMENT_USDC ?? String(DEFAULT_MAX_PAYMENT_USDC));
-    if (!Number.isFinite(maxPaymentUsdc) || maxPaymentUsdc < 0) {
-      throw new Error("SingIt maxPaymentUsdc must be a non-negative number");
+    const envLimit = process.env.SINGIT_MAX_PAYMENT_USDC?.trim();
+    if (config.maxPaymentUsdc !== undefined) {
+      const limit = config.maxPaymentUsdc;
+      if (!Number.isFinite(limit) || limit < 0) {
+        throw new Error("SingIt maxPaymentUsdc must be a non-negative number");
+      }
+      const decimal = String(limit);
+      if (decimal.includes("e")) {
+        if (limit < 1e-6) {
+          this.maxPaymentAtomic = 0n;
+          return;
+        }
+        throw new Error("SingIt maxPaymentUsdc must be less than 1e21");
+      }
+      this.maxPaymentAtomic = this.floorPaymentAtomic(decimal);
+    } else {
+      if (envLimit && !/^\d+(\.\d+)?$/.test(envLimit)) {
+        throw new Error("SingIt SINGIT_MAX_PAYMENT_USDC must be a non-negative number");
+      }
+      this.maxPaymentAtomic = this.floorPaymentAtomic(envLimit || String(DEFAULT_MAX_PAYMENT_USDC));
     }
-    // Truncate to whole micro-USDC so the limit is never rounded up. Twelve decimals absorb
-    // floating point noise such as 0.07 being stored as 0.070000000000000007.
-    const [whole, fraction = ""] = maxPaymentUsdc.toFixed(12).split(".");
-    this.maxPaymentAtomic = BigInt(
-      whole + fraction.slice(0, USDC_DECIMALS).padEnd(USDC_DECIMALS, "0"),
-    );
   }
 
   /**
@@ -58,7 +67,7 @@ export class SingitActionProvider extends ActionProvider<WalletProvider> {
 Lists the language models available through SingIt Ask (https://ask.singitai.app), a pay-per-call gateway.
 Listing is free. Returns each model id, name, tags and, where known, its price per million tokens in USD.
 Use an id from this list as the model for the ask action.
-Includes the free model 'free/deepseek-v4.1-flash', which answers without any payment within a daily limit.`,
+Includes the free model 'free/deepseek-v4.1-flash', which answers without any payment within a small daily limit.`,
     schema: ListModelsSchema,
   })
   async listModels(
@@ -110,6 +119,7 @@ A payment above the configured per-call limit is never signed.
 Call list_models first if you are unsure which model to use.
 Use model 'free/deepseek-v4.1-flash' for a short answer (up to 400 tokens) with no payment.
 For Claude Opus models the flat price used here includes room for thinking tokens and is usually dearer than for other models.
+A failed call may still have been charged; check settlement/billing and do not blindly retry.
 Returns the model's answer and the amount charged in USDC micro-units (billing.totalAtomic).`,
     schema: AskSchema,
   })
@@ -147,7 +157,17 @@ Returns the model's answer and the amount charged in USDC micro-units (billing.t
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
 
-      const text = await response.text();
+      const settlement = this.readSettlement(response);
+      let text: string;
+      try {
+        text = await response.text();
+      } catch (error) {
+        return JSON.stringify({
+          error: true,
+          message: `The answer from SingIt Ask could not be read and the payment may have been charged: ${error instanceof Error ? error.message : String(error)}`,
+          settlement,
+        });
+      }
       let data: Record<string, unknown> | undefined;
       try {
         data = JSON.parse(text) as Record<string, unknown>;
@@ -158,7 +178,8 @@ Returns the model's answer and the amount charged in USDC micro-units (billing.t
       if (!response.ok) {
         return JSON.stringify({
           error: true,
-          message: `SingIt Ask returned status ${response.status}. Payment is settled only on a successful answer.`,
+          message: `SingIt Ask returned status ${response.status}.`,
+          settlement,
           details: data && Object.keys(data).length > 0 ? data : text.slice(0, 500),
           paymentError: this.readPaymentError(response),
         });
@@ -171,6 +192,7 @@ Returns the model's answer and the amount charged in USDC micro-units (billing.t
           error: true,
           message: "SingIt Ask returned a response without an answer",
           billing: data?.billing,
+          settlement,
         });
       }
 
@@ -180,6 +202,7 @@ Returns the model's answer and the amount charged in USDC micro-units (billing.t
           model: data?.model,
           answer,
           billing: data?.billing,
+          settlement,
         },
         null,
         2,
@@ -202,6 +225,61 @@ Returns the model's answer and the amount charged in USDC micro-units (billing.t
     network.networkId !== undefined && SUPPORTED_NETWORKS.includes(network.networkId);
 
   /**
+   * Floors a plain decimal payment limit to whole micro-USDC without rounding.
+   *
+   * @param decimal - The validated non-negative decimal string
+   * @returns The payment limit in atomic units
+   */
+  private floorPaymentAtomic(decimal: string): bigint {
+    const [whole, fraction = ""] = decimal.split(".");
+    return BigInt(whole + fraction.slice(0, USDC_DECIMALS).padEnd(USDC_DECIMALS, "0"));
+  }
+
+  /**
+   * Decodes a base64 header value as UTF-8 text.
+   *
+   * @param header - The base64-encoded header value
+   * @returns The decoded UTF-8 text
+   */
+  private decodeBase64Utf8(header: string): string {
+    const bytes = Uint8Array.from(atob(header), c => c.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  }
+
+  /**
+   * Reads settlement details from the PAYMENT-RESPONSE header when available.
+   *
+   * @param response - The gateway response
+   * @returns Known settlement fields, or undefined for a missing or malformed header
+   */
+  private readSettlement(response: Response): Record<string, string | boolean> | undefined {
+    const header =
+      response.headers?.get("PAYMENT-RESPONSE") ?? response.headers?.get("payment-response");
+    if (!header) {
+      return undefined;
+    }
+    try {
+      const decoded: unknown = JSON.parse(this.decodeBase64Utf8(header));
+      if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+        return undefined;
+      }
+      const fields = decoded as Record<string, unknown>;
+      const settlement: Record<string, string | boolean> = {};
+      if (typeof fields.success === "boolean") {
+        settlement.success = fields.success;
+      }
+      for (const key of ["transaction", "network", "errorReason"]) {
+        if (typeof fields[key] === "string") {
+          settlement[key] = fields[key];
+        }
+      }
+      return settlement;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Reads the reason a payment was refused from the PAYMENT-REQUIRED response header, if present.
    *
    * @param response - The failed response
@@ -213,7 +291,7 @@ Returns the model's answer and the amount charged in USDC micro-units (billing.t
       return undefined;
     }
     try {
-      const decoded = JSON.parse(atob(header)) as { error?: unknown };
+      const decoded = JSON.parse(this.decodeBase64Utf8(header)) as { error?: unknown };
       return typeof decoded.error === "string" ? decoded.error : undefined;
     } catch {
       return undefined;
@@ -269,4 +347,10 @@ Returns the model's answer and the amount charged in USDC micro-units (billing.t
   }
 }
 
+/**
+ * Creates a SingIt action provider.
+ *
+ * @param config - Optional per-call payment configuration
+ * @returns The configured provider
+ */
 export const singitActionProvider = (config?: SingitConfig) => new SingitActionProvider(config);

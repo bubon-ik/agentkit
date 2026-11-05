@@ -20,7 +20,9 @@ singit/
 | `list_models` | Lists the models SingIt Ask serves with their ids and prices. Free.                                  |
 | `ask`         | Sends a prompt to a model and pays for the answer over x402. Returns the answer and what was charged. |
 
-`ask` accepts a `prompt`, and optionally a `model`, a `system` message and `maxTokens` (1 to 1200, default 800). The price grows with the model and with `maxTokens`. The model id `free/deepseek-v4.1-flash` answers without any payment, up to 400 tokens, within a daily limit per network.
+`ask` accepts a `prompt`, and optionally a `model`, a `system` message and `maxTokens` (1 to 1200, default 800). The price grows with the model and with `maxTokens`. The model id `free/deepseek-v4.1-flash` answers without any payment, up to 400 tokens, within a small daily limit per visitor.
+
+A failed `ask` call may still have been charged. Check the returned `settlement` details and billing before retrying; do not blindly retry. When available, `settlement` includes the payment response header's `success`, `transaction`, `network`, and `errorReason` fields.
 
 ## Setup
 
@@ -62,4 +64,4 @@ Testnets are not supported.
 
 - Models and prices: https://ask.singitai.app/v1/models
 - Service description for agents: https://ask.singitai.app/llms.txt
-- First paid call walkthrough: https://github.com/bubon-ik/SingItAI/blob/main/docs/first-paid-call.md
+- First paid call walkthrough: https://github.com/SingItAi/SingItAI/blob/main/docs/first-paid-call.md
